@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>실시간 자세 추정 및 분류 데모 (MoveNet)</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            margin: 0;
+            padding: 20px;
+            background-color: #f0f0f0;
+        }
+        h1 {
+            color: #333;
+        }
+        #liveView {
+            position: relative;
+            width: 640px; /* 비디오/캔버스 크기 */
+            height: 480px;
+            margin-top: 20px;
+            border: 1px solid #ccc;
+        }
+        #webcam {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            visibility: hidden; /* 비디오 요소는 숨기고 캔버스에 그림 */
+        }
+        #outputCanvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 1.2em;
+            color: white;
+            background-color: rgba(0, 0, 0, 0.7);
+            padding: 10px 20px;
+            border-radius: 5px;
+            z-index: 10; /* 캔버스 위에 표시 */
+        }
+        .warning {
+            background-color: #fff3cd;
+            color: #856404;
+            padding: 15px;
+            border: 1px solid #ffeeba;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            max-width: 640px;
+            text-align: center;
+        }
+        /* 자세 표시 텍스트 스타일 */
+        .pose-text {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background-color: rgba(0, 0, 0, 0.6);
+            color: white;
+            padding: 8px 12px;
+            font-size: 1.5em;
+            border-radius: 5px;
+            z-index: 5; /* 캔버스 위에 표시되지만 로딩보다는 아래 */
+        }
+    </style>
+    <!-- TensorFlow.js 라이브러리 로드 -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-converter"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl"></script>
+    <!-- Pose Detection 모델 로드 -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection"></script>
+</head>
+<body>
+    <h1>실시간 자세 추정 및 분류 데모 (MoveNet)</h1>
+
+    <div class="warning">
+        <strong>주의:</strong> 이 데모는 <strong>사람</strong> 자세 추정 모델(MoveNet)을 사용합니다.<br>
+        강아지에게 적용 시 정확도가 매우 낮거나 작동하지 않을 수 있습니다.<br>
+        웹캠 접근 권한이 필요합니다. '앉아' 자세 분류는 매우 기본적인 규칙으로 구현되었습니다.
+    </div>
+
+    <div id="liveView">
+        <video id="webcam" autoplay playsinline></video>
+        <canvas id="outputCanvas"></canvas>
+        <div id="loading">모델 및 웹캠 로딩 중...</div>
+        <!-- 자세 표시 영역 -->
+        <div id="poseResult" class="pose-text" style="display: none;"></div>
+    </div>
+
+    <script>
+        const videoElement = document.getElementById('webcam');
+        const canvasElement = document.getElementById('outputCanvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const loadingElement = document.getElementById('loading');
+        const poseResultElement = document.getElementById('poseResult'); // 자세 결과 표시 요소
+
+        let detector;
+        let rafId; // requestAnimationFrame ID
+
+        // MoveNet 모델 설정
+        const detectorConfig = {
+            modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING,
+            enableSmoothing: true
+        };
+
+        // 키포인트 인덱스 (MoveNet 기준, 필요에 따라 사용)
+        const KEYPOINTS = {
+            NOSE: 0, LEFT_EYE: 1, RIGHT_EYE: 2, LEFT_EAR: 3, RIGHT_EAR: 4,
+            LEFT_SHOULDER: 5, RIGHT_SHOULDER: 6, LEFT_ELBOW: 7, RIGHT_ELBOW: 8,
+            LEFT_WRIST: 9, RIGHT_WRIST: 10, LEFT_HIP: 11, RIGHT_HIP: 12,
+            LEFT_KNEE: 13, RIGHT_KNEE: 14, LEFT_ANKLE: 15, RIGHT_ANKLE: 16
+        };
+
+        // 키포인트 연결 정의
+        const connections = poseDetection.util.getAdjacentPairs(poseDetection.SupportedModels.MoveNet);
+
+        // 웹캠 설정 및 시작
+        async function setupWebcam() {
+            return new Promise((resolve, reject) => {
+                navigator.mediaDevices.getUserMedia({ video: true })
+                    .then(stream => {
+                        videoElement.srcObject = stream;
+                        videoElement.addEventListener('loadeddata', () => {
+                            canvasElement.width = videoElement.videoWidth;
+                            canvasElement.height = videoElement.videoHeight;
+                            resolve();
+                        });
+                    })
+                    .catch(err => {
+                        console.error("웹캠 접근 오류:", err);
+                        loadingElement.innerText = "웹캠 접근 실패. 권한을 확인하세요.";
+                        reject(err);
+                    });
+            });
+        }
+
+        // 모델 로드
+        async function loadModel() {
+            try {
+                detector = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, detectorConfig);
+                console.log("MoveNet 모델 로드 완료.");
+            } catch (error) {
+                console.error("모델 로드 오류:", error);
+                loadingElement.innerText = "모델 로드 실패.";
+                throw error;
+            }
+        }
+
+        // 키포인트 그리기
+        function drawKeypoint(keypoint) {
+            if (keypoint.score > 0.3) {
+                const radius = 5;
+                canvasCtx.beginPath();
+                canvasCtx.arc(keypoint.x, keypoint.y, radius, 0, 2 * Math.PI);
+                canvasCtx.fillStyle = 'aqua';
+                canvasCtx.fill();
+            }
+        }
+
+        // 스켈레톤(뼈대) 그리기
+        function drawSkeleton(keypoints) {
+            canvasCtx.fillStyle = 'aqua';
+            canvasCtx.strokeStyle = 'lime';
+            canvasCtx.lineWidth = 2;
+
+            keypoints.forEach(keypoint => {
+                if (keypoint.score > 0.3) {
+                    drawKeypoint(keypoint);
+                }
+            });
+
+            connections.forEach((pair) => {
+                const [i, j] = pair;
+                const kp1 = keypoints[i];
+                const kp2 = keypoints[j];
+                if (kp1.score > 0.3 && kp2.score > 0.3) {
+                    canvasCtx.beginPath();
+                    canvasCtx.moveTo(kp1.x, kp1.y);
+                    canvasCtx.lineTo(kp2.x, kp2.y);
+                    canvasCtx.stroke();
+                }
+            });
+        }
+
+        // *** 자세 분류 함수 (간단한 규칙 기반) ***
+        function classifyPose(keypoints) {
+            const confidenceThreshold = 0.3; // 키포인트 신뢰도 임계값
+
+            const leftShoulder = keypoints[KEYPOINTS.LEFT_SHOULDER];
+            const rightShoulder = keypoints[KEYPOINTS.RIGHT_SHOULDER];
+            const leftHip = keypoints[KEYPOINTS.LEFT_HIP];
+            const rightHip = keypoints[KEYPOINTS.RIGHT_HIP];
+            const leftKnee = keypoints[KEYPOINTS.LEFT_KNEE];
+            const rightKnee = keypoints[KEYPOINTS.RIGHT_KNEE];
+            // const leftAnkle = keypoints[KEYPOINTS.LEFT_ANKLE];
+            // const rightAnkle = keypoints[KEYPOINTS.RIGHT_ANKLE];
+
+            // 필수 키포인트들이 충분히 신뢰도 있게 감지되었는지 확인
+            if (leftShoulder.score < confidenceThreshold || rightShoulder.score < confidenceThreshold ||
+                leftHip.score < confidenceThreshold || rightHip.score < confidenceThreshold ||
+                leftKnee.score < confidenceThreshold || rightKnee.score < confidenceThreshold) {
+                return null; // 필요한 점들이 안보이면 판별 불가
+            }
+
+            // 평균 y좌표 계산 (캔버스에서는 y값이 아래로 갈수록 증가)
+            const avgShoulderY = (leftShoulder.y + rightShoulder.y) / 2;
+            const avgHipY = (leftHip.y + rightHip.y) / 2;
+            const avgKneeY = (leftKnee.y + rightKnee.y) / 2;
+            // const avgAnkleY = (leftAnkle.y + rightAnkle.y) / 2;
+
+            // 간단한 '앉기' 조건:
+            // 1. 엉덩이가 무릎보다 아래 있거나 비슷한 높이에 있는가? (약간의 오차 허용)
+            // 2. 어깨가 엉덩이보다 확실히 위에 있는가? (눕거나 엎드린 자세 제외 목적)
+            const hipLowerThanKnee = avgHipY >= (avgKneeY - 20); // 엉덩이가 무릎보다 아래 (y값이 크거나 같음, 오차 20px)
+            const shoulderHigherThanHip = avgShoulderY < (avgHipY - 50); // 어깨가 엉덩이보다 위 (y값이 작음, 차이 50px 이상)
+
+            if (hipLowerThanKnee && shoulderHigherThanHip) {
+                return "Sitting 🧘"; // 앉음
+            } else if (shoulderHigherThanHip) {
+                // 서 있는 상태는 어깨가 엉덩이 위에 있고, 엉덩이가 무릎보다 위에 있을 때
+                 const hipHigherThanKnee = avgHipY < (avgKneeY - 30); // 엉덩이가 무릎보다 확실히 위 (차이 30px 이상)
+                 if(hipHigherThanKnee) {
+                    return "Standing🧍"; // 서있음
+                 }
+            }
+
+            return null; // 위 조건에 해당하지 않으면 판별 불가 또는 다른 자세
+        }
+
+
+        // 실시간 감지 및 그리기 루프
+        async function renderPrediction() {
+            if (!detector || !videoElement.readyState === 4) {
+                rafId = requestAnimationFrame(renderPrediction);
+                return;
+            }
+
+            const poses = await detector.estimatePoses(videoElement, { flipHorizontal: false });
+
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            canvasCtx.drawImage(videoElement, 0, 0, canvasElement.width, canvasElement.height);
+
+            let currentPose = null; // 현재 프레임에서 감지된 자세
+
+            if (poses && poses.length > 0) {
+                const keypoints = poses[0].keypoints;
+                drawSkeleton(keypoints);
+
+                // *** 자세 분류 실행 ***
+                currentPose = classifyPose(keypoints);
+            }
+
+            // *** 분류 결과 시각화 ***
+            if (currentPose) {
+                poseResultElement.innerText = currentPose;
+                poseResultElement.style.display = 'block'; // 결과 텍스트 보이기
+            } else {
+                poseResultElement.style.display = 'none'; // 결과 숨기기
+            }
+
+
+            rafId = requestAnimationFrame(renderPrediction);
+        }
+
+        // 메인 실행 함수
+        async function main() {
+            try {
+                await tf.setBackend('webgl');
+                await loadModel();
+                await setupWebcam();
+
+                loadingElement.style.display = 'none';
+                videoElement.play();
+                renderPrediction();
+
+            } catch (error) {
+                console.error("초기화 중 오류 발생:", error);
+                if (loadingElement.innerText.includes('로딩 중')) {
+                   loadingElement.innerText = "오류 발생. 콘솔 확인.";
+                }
+            }
+        }
+
+        // 프로그램 시작
+        main();
+
+        // 페이지 벗어날 때 정리
+        window.addEventListener('beforeunload', () => {
+            if (rafId) {
+                cancelAnimationFrame(rafId);
+            }
+            if (detector) {
+                detector.dispose();
+            }
+            if (videoElement.srcObject) {
+                videoElement.srcObject.getTracks().forEach(track => track.stop());
+            }
+        });
+
+    </script>
+</body>
+</html>
