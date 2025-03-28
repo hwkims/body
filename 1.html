@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>실시간 자세 추정 데모 (MoveNet)</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            margin: 0;
+            padding: 20px;
+            background-color: #f0f0f0;
+        }
+        h1 {
+            color: #333;
+        }
+        #liveView {
+            position: relative;
+            width: 640px; /* 비디오/캔버스 크기 */
+            height: 480px;
+            margin-top: 20px;
+            border: 1px solid #ccc;
+        }
+        #webcam {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            /* 비디오 요소는 숨기고 캔버스에 그림 */
+            visibility: hidden;
+        }
+        #outputCanvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 1.2em;
+            color: white;
+            background-color: rgba(0, 0, 0, 0.7);
+            padding: 10px 20px;
+            border-radius: 5px;
+            z-index: 10; /* 캔버스 위에 표시 */
+        }
+        .warning {
+            background-color: #fff3cd;
+            color: #856404;
+            padding: 15px;
+            border: 1px solid #ffeeba;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            max-width: 640px;
+            text-align: center;
+        }
+    </style>
+    <!-- TensorFlow.js 라이브러리 로드 -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-converter"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl"></script>
+    <!-- Pose Detection 모델 로드 -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection"></script>
+</head>
+<body>
+    <h1>실시간 자세 추정 데모 (MoveNet)</h1>
+
+    <div class="warning">
+        <strong>주의:</strong> 이 데모는 <strong>사람</strong> 자세 추정 모델(MoveNet)을 사용합니다.<br>
+        강아지에게 적용 시 정확도가 매우 낮거나 작동하지 않을 수 있습니다.<br>
+        웹캠 접근 권한이 필요합니다.
+    </div>
+
+    <div id="liveView">
+        <video id="webcam" autoplay playsinline></video>
+        <canvas id="outputCanvas"></canvas>
+        <div id="loading">모델 및 웹캠 로딩 중...</div>
+    </div>
+
+    <script>
+        const videoElement = document.getElementById('webcam');
+        const canvasElement = document.getElementById('outputCanvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const loadingElement = document.getElementById('loading');
+
+        let detector;
+        let rafId; // requestAnimationFrame ID
+
+        // MoveNet 모델 설정 (SinglePose Lightning이 가볍고 빠름)
+        const detectorConfig = {
+            modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING,
+            enableSmoothing: true // 부드러운 결과를 위해
+        };
+
+        // 키포인트 연결 정의 (MoveNet 기준)
+        const connections = poseDetection.util.getAdjacentPairs(poseDetection.SupportedModels.MoveNet);
+
+        // 웹캠 설정 및 시작
+        async function setupWebcam() {
+            return new Promise((resolve, reject) => {
+                navigator.mediaDevices.getUserMedia({ video: true })
+                    .then(stream => {
+                        videoElement.srcObject = stream;
+                        videoElement.addEventListener('loadeddata', () => {
+                            // 비디오 크기에 맞춰 캔버스 크기 설정
+                            canvasElement.width = videoElement.videoWidth;
+                            canvasElement.height = videoElement.videoHeight;
+                            resolve();
+                        });
+                    })
+                    .catch(err => {
+                        console.error("웹캠 접근 오류:", err);
+                        loadingElement.innerText = "웹캠 접근 실패. 권한을 확인하세요.";
+                        reject(err);
+                    });
+            });
+        }
+
+        // 모델 로드
+        async function loadModel() {
+            try {
+                detector = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, detectorConfig);
+                console.log("MoveNet 모델 로드 완료.");
+            } catch (error) {
+                console.error("모델 로드 오류:", error);
+                loadingElement.innerText = "모델 로드 실패.";
+                throw error; // 에러를 다시 던져서 실행 중단
+            }
+        }
+
+        // 키포인트 그리기
+        function drawKeypoint(keypoint) {
+            if (keypoint.score > 0.3) { // 일정 신뢰도 이상만 그림
+                const radius = 5;
+                canvasCtx.beginPath();
+                canvasCtx.arc(keypoint.x, keypoint.y, radius, 0, 2 * Math.PI);
+                canvasCtx.fillStyle = 'aqua'; // 점 색상
+                canvasCtx.fill();
+            }
+        }
+
+        // 선 그리기
+        function drawSegment([ay, ax], [by, bx], color, scale) {
+             // drawSegment 함수는 pose-detection 라이브러리 자체에 포함되어 있지 않으므로 직접 구현
+             // 다만, 아래 drawSkeleton 함수에서 직접 연결을 그림
+        }
+
+        // 스켈레톤(뼈대) 그리기
+        function drawSkeleton(keypoints) {
+            canvasCtx.fillStyle = 'aqua'; // 점 색상
+            canvasCtx.strokeStyle = 'lime'; // 선 색상
+            canvasCtx.lineWidth = 2;
+
+            // 각 키포인트 그리기
+            keypoints.forEach(keypoint => {
+                if (keypoint.score > 0.3) {
+                    drawKeypoint(keypoint);
+                }
+            });
+
+            // 정의된 연결선 그리기
+            connections.forEach((pair) => {
+                const [i, j] = pair;
+                const kp1 = keypoints[i];
+                const kp2 = keypoints[j];
+
+                // 두 키포인트 모두 신뢰도가 충분히 높을 때만 선을 그림
+                if (kp1.score > 0.3 && kp2.score > 0.3) {
+                    canvasCtx.beginPath();
+                    canvasCtx.moveTo(kp1.x, kp1.y);
+                    canvasCtx.lineTo(kp2.x, kp2.y);
+                    canvasCtx.stroke();
+                }
+            });
+        }
+
+
+        // 실시간 감지 및 그리기 루프
+        async function renderPrediction() {
+            if (!detector || !videoElement.readyState === 4) {
+                // 모델이나 비디오가 준비되지 않았으면 대기
+                rafId = requestAnimationFrame(renderPrediction);
+                return;
+            }
+
+            // 1. 비디오 프레임에서 자세 추정
+            const poses = await detector.estimatePoses(videoElement, {
+                flipHorizontal: false // 웹캠 영상 좌우 반전 여부
+            });
+
+            // 2. 캔버스 지우고 비디오 프레임 그리기
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            // 웹캠 영상을 좌우 반전 없이 그대로 그리고 싶다면 아래 사용
+            canvasCtx.drawImage(videoElement, 0, 0, canvasElement.width, canvasElement.height);
+            /*
+            // 웹캠 영상이 좌우 반전되어 보이는 것을 원하면 아래 사용
+            canvasCtx.save();
+            canvasCtx.scale(-1, 1);
+            canvasCtx.translate(-canvasElement.width, 0);
+            canvasCtx.drawImage(videoElement, 0, 0, canvasElement.width, canvasElement.height);
+            canvasCtx.restore();
+            */
+
+
+            // 3. 감지된 자세(뼈대) 그리기
+            if (poses && poses.length > 0) {
+                // 첫 번째 감지된 사람의 키포인트 사용
+                const keypoints = poses[0].keypoints;
+                drawSkeleton(keypoints);
+
+                // --- 여기서 '앉아' 같은 자세 분류 로직 추가 가능 ---
+                // 예: 특정 관절(엉덩이, 무릎)의 각도나 상대적 위치를 계산하여 판단
+                // classifyPose(keypoints);
+                // ----------------------------------------------------
+
+            }
+
+            // 다음 프레임 처리 요청
+            rafId = requestAnimationFrame(renderPrediction);
+        }
+
+        // 메인 실행 함수
+        async function main() {
+            try {
+                await tf.setBackend('webgl'); // GPU 가속 사용 (가능하다면)
+                await loadModel();
+                await setupWebcam();
+
+                loadingElement.style.display = 'none'; // 로딩 메시지 숨기기
+                videoElement.play(); // 비디오 재생 시작 (숨겨져 있음)
+                renderPrediction(); // 실시간 감지 시작
+
+            } catch (error) {
+                console.error("초기화 중 오류 발생:", error);
+                // 로딩 메시지에 오류 표시 (이미 setupWebcam이나 loadModel에서 했을 수 있음)
+                if (loadingElement.innerText.includes('로딩 중')) {
+                   loadingElement.innerText = "오류 발생. 콘솔 확인.";
+                }
+            }
+        }
+
+        // 프로그램 시작
+        main();
+
+        // 페이지 벗어날 때 정리
+        window.addEventListener('beforeunload', () => {
+            if (rafId) {
+                cancelAnimationFrame(rafId);
+            }
+            if (detector) {
+                detector.dispose();
+            }
+            if (videoElement.srcObject) {
+                videoElement.srcObject.getTracks().forEach(track => track.stop());
+            }
+        });
+
+    </script>
+</body>
+</html>
