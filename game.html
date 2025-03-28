@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>따라해요! 포즈 게임</title>
+    <style>
+        body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; margin: 0; padding: 20px; background-color: #f0f0f0; }
+        h1 { color: #333; }
+        #container { display: flex; flex-direction: column; align-items: center; gap: 15px; }
+        #liveView { position: relative; width: 640px; height: 480px; border: 1px solid #ccc; background-color: #000; }
+        #webcam { position: absolute; top: 0; left: 0; width: 100%; height: 100%; visibility: hidden; }
+        #outputCanvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+        #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 1.2em; color: white; background-color: rgba(0, 0, 0, 0.7); padding: 10px 20px; border-radius: 5px; z-index: 10; }
+        .warning { background-color: #fff3cd; color: #856404; padding: 15px; border: 1px solid #ffeeba; border-radius: 5px; max-width: 640px; text-align: center; }
+        /* 게임 UI 스타일 */
+        #gameUI { width: 640px; background-color: #e0f7fa; padding: 15px; border-radius: 8px; box-sizing: border-box; text-align: center; }
+        #commandArea { font-size: 1.8em; font-weight: bold; color: #00796b; min-height: 50px; /* 높이 고정으로 레이아웃 안정화 */ display: flex; align-items: center; justify-content: center; }
+        #feedbackArea { font-size: 1.2em; color: #d32f2f; margin-top: 5px; min-height: 25px; }
+        #gameButton { padding: 12px 20px; font-size: 1.1em; cursor: pointer; border: none; border-radius: 5px; background-color: #009688; color: white; transition: background-color 0.3s; margin-top: 10px; }
+        #gameButton:hover { background-color: #00796b; }
+        #gameButton.active { background-color: #f44336; }
+        #gameButton.active:hover { background-color: #d32f2f; }
+        /* 컨트롤 영역 (슬라이더) */
+        #controls { display: flex; flex-direction: column; gap: 10px; background-color: #e9e9e9; padding: 15px; border-radius: 8px; width: 640px; box-sizing: border-box; margin-top: 15px;}
+        .control-item { display: flex; align-items: center; gap: 10px; }
+        .control-item label { min-width: 130px; text-align: right; }
+        .control-item input[type="range"] { flex-grow: 1; }
+        .control-item span { min-width: 40px; text-align: right; font-weight: bold; }
+    </style>
+    <!-- 라이브러리 로드 (동일) -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-converter"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection"></script>
+</head>
+<body>
+    <h1>따라해요! 포즈 게임</h1>
+
+    <div class="warning">
+        <strong>주의:</strong> 사람 자세 추정 모델(MoveNet) 사용 중입니다.<br>
+        음성 명령에 맞춰 포즈를 취해보세요! 웹캠 및 마이크/스피커 권한이 필요할 수 있습니다.
+    </div>
+
+    <div id="container">
+        <!-- 게임 UI -->
+        <div id="gameUI">
+            <div id="commandArea">게임을 시작하세요!</div>
+            <div id="feedbackArea"></div>
+            <button id="gameButton">게임 시작</button>
+            <!-- <div id="scoreArea">점수: 0</div> -->
+        </div>
+
+        <div id="liveView">
+            <video id="webcam" autoplay playsinline></video>
+            <canvas id="outputCanvas"></canvas>
+            <div id="loading">모델 및 웹캠 로딩 중...</div>
+            <!-- <div id="poseResult" class="pose-text" style="display: none;"></div> -->
+        </div>
+
+        <!-- 컨트롤 영역 (슬라이더 - 튜닝용) -->
+        <div id="controls">
+             <p style="text-align: center; margin: 0 0 10px 0; font-weight: bold;">자세 판별 각도 조절 (튜닝용)</p>
+            <div class="control-item">
+                <label for="sittingThreshold">앉기 판별 각도 (<):</label>
+                <input type="range" id="sittingThreshold" min="90" max="170" value="140">
+                <span id="sittingThresholdValue">140</span>°
+            </div>
+            <div class="control-item">
+                <label for="standingThreshold">서기 판별 각도 (>):</label>
+                <input type="range" id="standingThreshold" min="100" max="179" value="160">
+                <span id="standingThresholdValue">160</span>°
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- DOM 요소 ---
+        const videoElement = document.getElementById('webcam');
+        const canvasElement = document.getElementById('outputCanvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const loadingElement = document.getElementById('loading');
+        // const poseResultElement = document.getElementById('poseResult'); // 사용 안 함
+        const commandArea = document.getElementById('commandArea');
+        const feedbackArea = document.getElementById('feedbackArea');
+        const gameButton = document.getElementById('gameButton');
+        // const scoreArea = document.getElementById('scoreArea'); // 점수 기능은 주석 처리
+        const sittingThresholdSlider = document.getElementById('sittingThreshold');
+        const sittingThresholdValueSpan = document.getElementById('sittingThresholdValue');
+        const standingThresholdSlider = document.getElementById('standingThreshold');
+        const standingThresholdValueSpan = document.getElementById('standingThresholdValue');
+
+        // --- 전역 변수 ---
+        let detector;
+        let rafId;
+        let sittingThresholdAngle = 140;
+        let standingThresholdAngle = 160;
+
+        // --- 게임 관련 변수 ---
+        let isGameActive = false;
+        let currentCommand = null;
+        let commandTimeoutId = null; // 다음 명령 지연 타이머 ID
+        let checkingPose = false; // 현재 포즈 확인 중인지 여부 플래그
+        // let score = 0; // 점수 기능은 주석 처리
+        const commands = ["앉아", "서", "왼손 들어", "오른손 들어", "양손 들어"];
+        const poseSuccessMessages = ["잘했어요!", "좋아요!", "성공!", "완벽해요!", "정답!"];
+
+        // --- Web Speech API (TTS) 변수 ---
+        const synth = window.speechSynthesis;
+        let voices = [];
+
+        // --- 모델 및 키포인트 설정 (동일) ---
+        const detectorConfig = { modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING, enableSmoothing: true };
+        const KEYPOINTS = { /* ... 이전 코드와 동일 ... */
+            NOSE: 0, LEFT_EYE: 1, RIGHT_EYE: 2, LEFT_EAR: 3, RIGHT_EAR: 4,
+            LEFT_SHOULDER: 5, RIGHT_SHOULDER: 6, LEFT_ELBOW: 7, RIGHT_ELBOW: 8,
+            LEFT_WRIST: 9, RIGHT_WRIST: 10, LEFT_HIP: 11, RIGHT_HIP: 12,
+            LEFT_KNEE: 13, RIGHT_KNEE: 14, LEFT_ANKLE: 15, RIGHT_ANKLE: 16
+        };
+        const connections = poseDetection.util.getAdjacentPairs(poseDetection.SupportedModels.MoveNet);
+        const confidenceThreshold = 0.3; // 키포인트 신뢰도 임계값
+
+        // --- 함수들 ---
+
+        // 웹캠 설정, 모델 로드, 그리기 함수 (동일)
+        async function setupWebcam() { /* ... 이전 코드와 동일 ... */
+             return new Promise((resolve, reject) => {
+                navigator.mediaDevices.getUserMedia({ video: true })
+                    .then(stream => {
+                        videoElement.srcObject = stream;
+                        videoElement.addEventListener('loadeddata', () => {
+                            canvasElement.width = videoElement.videoWidth;
+                            canvasElement.height = videoElement.videoHeight;
+                            resolve();
+                        });
+                    })
+                    .catch(err => {
+                        console.error("웹캠 접근 오류:", err);
+                        loadingElement.innerText = "웹캠 접근 실패. 권한을 확인하세요.";
+                        reject(err);
+                    });
+            });
+        }
+        async function loadModel() { /* ... 이전 코드와 동일 ... */
+            try {
+                detector = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, detectorConfig);
+                console.log("MoveNet 모델 로드 완료.");
+            } catch (error) {
+                console.error("모델 로드 오류:", error);
+                loadingElement.innerText = "모델 로드 실패.";
+                throw error;
+            }
+        }
+        function drawKeypoint(keypoint) { /* ... 이전 코드와 동일 ... */
+             if (keypoint.score > confidenceThreshold) { /* confidenceThreshold 사용 */
+                const radius = 5; canvasCtx.beginPath();
+                canvasCtx.arc(keypoint.x, keypoint.y, radius, 0, 2 * Math.PI);
+                canvasCtx.fillStyle = 'aqua'; canvasCtx.fill();
+            }
+        }
+        function drawSkeleton(keypoints) { /* ... 이전 코드와 동일 ... */
+            canvasCtx.fillStyle = 'aqua'; canvasCtx.strokeStyle = 'lime'; canvasCtx.lineWidth = 2;
+            keypoints.forEach(keypoint => drawKeypoint(keypoint));
+            connections.forEach((pair) => {
+                const [i, j] = pair; const kp1 = keypoints[i]; const kp2 = keypoints[j];
+                if (kp1.score > confidenceThreshold && kp2.score > confidenceThreshold) { /* confidenceThreshold 사용 */
+                    canvasCtx.beginPath(); canvasCtx.moveTo(kp1.x, kp1.y); canvasCtx.lineTo(kp2.x, kp2.y); canvasCtx.stroke();
+                }
+            });
+        }
+        function calculateAngle(a, b, c) { /* ... 이전 코드와 동일 ... */
+            const baX = a.x - b.x; const baY = a.y - b.y; const bcX = c.x - b.x; const bcY = c.y - b.y;
+            const dotProduct = baX * bcX + baY * bcY;
+            const magnitudeBA = Math.sqrt(baX * baX + baY * baY); const magnitudeBC = Math.sqrt(bcX * bcX + bcY * bcY);
+            if (magnitudeBA === 0 || magnitudeBC === 0) return null;
+            const cosTheta = dotProduct / (magnitudeBA * magnitudeBC);
+            const clampedCosTheta = Math.max(-1.0, Math.min(1.0, cosTheta));
+            return Math.acos(clampedCosTheta) * (180 / Math.PI);
+        }
+
+        // --- Web Speech API (TTS) 함수 ---
+        function populateVoiceList() {
+            voices = synth.getVoices().filter(voice => voice.lang.startsWith('ko')); // 한국어 목소리 필터링
+             console.log("사용 가능한 한국어 목소리:", voices);
+             // 필요하다면 특정 목소리 선택 로직 추가
+        }
+        // 브라우저에 따라 voices 로딩 타이밍이 다름
+        populateVoiceList();
+        if (speechSynthesis.onvoiceschanged !== undefined) {
+            speechSynthesis.onvoiceschanged = populateVoiceList;
+        }
+
+        function speak(text, onEndCallback = null) {
+            if (synth.speaking) {
+                // console.warn('TTS가 이미 말하는 중입니다. 취소하고 새로 시작합니다.');
+                // synth.cancel(); // 이전 말 취소 (옵션)
+                // 말을 겹치게 하지 않으려면 여기서 return 하거나 큐 사용
+                return; // 간단히 겹치지 않게 함
+            }
+            const utterThis = new SpeechSynthesisUtterance(text);
+            utterThis.onend = function (event) {
+                // console.log('TTS 말하기 종료.');
+                if (onEndCallback) {
+                    onEndCallback();
+                }
+            }
+            utterThis.onerror = function (event) {
+                console.error('TTS 오류 발생:', event);
+            }
+            // 한국어 목소리 설정 (사용 가능한 경우)
+            if (voices.length > 0) {
+                utterThis.voice = voices[0]; // 첫 번째 한국어 목소리 사용
+            } else {
+                 utterThis.lang = 'ko-KR'; // 언어 코드 지정
+            }
+            utterThis.pitch = 1; // 음 높낮이 (0 ~ 2)
+            utterThis.rate = 1; // 말하기 속도 (0.1 ~ 10)
+            synth.speak(utterThis);
+        }
+
+        // --- 게임 함수 ---
+        function getRandomCommand() {
+            const randomIndex = Math.floor(Math.random() * commands.length);
+            return commands[randomIndex];
+        }
+
+        function nextCommand() {
+            clearTimeout(commandTimeoutId); // 이전 지연 취소
+            checkingPose = false; // 포즈 확인 상태 초기화
+            feedbackArea.innerText = ""; // 피드백 초기화
+
+            currentCommand = getRandomCommand();
+            commandArea.innerText = `"${currentCommand}" 하세요!`;
+            speak(currentCommand, () => {
+                // 명령을 말한 후에 포즈 확인 시작 (선택적 지연)
+                setTimeout(() => { checkingPose = true; }, 500); // 0.5초 후 포즈 확인 시작
+            });
+        }
+
+        function poseSuccess() {
+            checkingPose = false; // 포즈 확인 중지
+            // score++; // 점수 기능 주석 처리
+            // scoreArea.innerText = `점수: ${score}`; // 점수 기능 주석 처리
+            const successMsg = poseSuccessMessages[Math.floor(Math.random() * poseSuccessMessages.length)];
+            feedbackArea.innerText = successMsg;
+            speak(successMsg, () => {
+                // 칭찬 후에 다음 명령 지연 호출
+                commandTimeoutId = setTimeout(nextCommand, 1500); // 1.5초 후 다음 명령
+            });
+        }
+
+        function startGame() {
+            if (isGameActive) return;
+            isGameActive = true;
+            gameButton.textContent = '게임 중지';
+            gameButton.classList.add('active');
+            // score = 0; // 점수 기능 주석 처리
+            // scoreArea.innerText = `점수: ${score}`; // 점수 기능 주석 처리
+            commandArea.innerText = "게임 시작!";
+            speak("게임을 시작합니다!", () => {
+                commandTimeoutId = setTimeout(nextCommand, 1000); // 1초 후 첫 명령
+            });
+        }
+
+        function stopGame() {
+            if (!isGameActive) return;
+            isGameActive = false;
+            checkingPose = false;
+            clearTimeout(commandTimeoutId);
+            synth.cancel(); // 진행 중인 TTS 취소
+            gameButton.textContent = '게임 시작';
+            gameButton.classList.remove('active');
+            commandArea.innerText = '게임이 중지되었습니다.';
+            feedbackArea.innerText = '';
+            currentCommand = null;
+        }
+
+        // 확장된 자세 분류 함수
+        function classifyPoseExtended(keypoints, targetCommand) {
+            if (!targetCommand) return false; // 명령 없으면 판별 불가
+
+            // --- 공통 키포인트 가져오기 ---
+            const leftShoulder = keypoints[KEYPOINTS.LEFT_SHOULDER];
+            const rightShoulder = keypoints[KEYPOINTS.RIGHT_SHOULDER];
+            const leftHip = keypoints[KEYPOINTS.LEFT_HIP];
+            const rightHip = keypoints[KEYPOINTS.RIGHT_HIP];
+            const leftKnee = keypoints[KEYPOINTS.LEFT_KNEE];
+            const rightKnee = keypoints[KEYPOINTS.RIGHT_KNEE];
+            const leftAnkle = keypoints[KEYPOINTS.LEFT_ANKLE];
+            const rightAnkle = keypoints[KEYPOINTS.RIGHT_ANKLE];
+            const leftWrist = keypoints[KEYPOINTS.LEFT_WRIST];
+            const rightWrist = keypoints[KEYPOINTS.RIGHT_WRIST];
+            const leftElbow = keypoints[KEYPOINTS.LEFT_ELBOW];
+            const rightElbow = keypoints[KEYPOINTS.RIGHT_ELBOW];
+
+            // --- 앉기 / 서기 판별 ---
+            if (targetCommand === "앉아" || targetCommand === "서") {
+                 // 각도 계산에 필요한 키포인트 신뢰도 확인
+                const angleKeypoints = [leftHip, rightHip, leftKnee, rightKnee, leftAnkle, rightAnkle, leftShoulder, rightShoulder];
+                 if (angleKeypoints.some(kp => kp.score < confidenceThreshold)) return false;
+
+                const avgShoulderY = (leftShoulder.y + rightShoulder.y) / 2;
+                const avgHipY = (leftHip.y + rightHip.y) / 2;
+                const isUpright = avgShoulderY < (avgHipY - 50);
+
+                if (isUpright) {
+                    const leftKneeAngle = calculateAngle(leftHip, leftKnee, leftAnkle);
+                    const rightKneeAngle = calculateAngle(rightHip, rightKnee, rightAnkle);
+                    let avgKneeAngle = null;
+                    if (leftKneeAngle !== null && rightKneeAngle !== null) avgKneeAngle = (leftKneeAngle + rightKneeAngle) / 2;
+                    else if (leftKneeAngle !== null) avgKneeAngle = leftKneeAngle;
+                    else if (rightKneeAngle !== null) avgKneeAngle = rightKneeAngle;
+
+                    if (avgKneeAngle !== null) {
+                        if (targetCommand === "앉아" && avgKneeAngle < sittingThresholdAngle) return true;
+                        if (targetCommand === "서" && avgKneeAngle > standingThresholdAngle) return true;
+                    }
+                }
+                return false; // 앉기/서기 조건 불만족
+            }
+
+            // --- 손 들기 판별 ---
+            // 필요한 키포인트: 어깨, 팔꿈치, 손목
+             if (![leftShoulder, rightShoulder, leftElbow, rightElbow, leftWrist, rightWrist].every(kp => kp.score > confidenceThreshold)) {
+                return false; // 손들기 판별에 필요한 점 부족
+            }
+
+            // 손을 들었다는 기준: 손목이 어깨보다 *위*에 있고 (Y값이 작음), 팔꿈치보다도 위에 있을 때
+            const wristShoulderThreshold = 30; // 손목이 어깨보다 이 값(px) 이상 위에 있어야 함
+            const wristElbowThreshold = 10; // 손목이 팔꿈치보다 이 값(px) 이상 위에 있어야 함
+
+            const isLeftHandUp = leftWrist.y < leftShoulder.y - wristShoulderThreshold && leftWrist.y < leftElbow.y - wristElbowThreshold;
+            const isRightHandUp = rightWrist.y < rightShoulder.y - wristShoulderThreshold && rightWrist.y < rightElbow.y - wristElbowThreshold;
+
+            if (targetCommand === "왼손 들어") {
+                return isLeftHandUp && !isRightHandUp; // 왼손만 들었을 때
+            }
+            if (targetCommand === "오른손 들어") {
+                return isRightHandUp && !isLeftHandUp; // 오른손만 들었을 때
+            }
+            if (targetCommand === "양손 들어") {
+                return isLeftHandUp && isRightHandUp; // 양손 다 들었을 때
+            }
+
+            return false; // 어떤 명령에도 해당하지 않음
+        }
+
+
+        // --- 실시간 감지 및 그리기 루프 ---
+        async function renderPrediction() {
+            if (!detector || videoElement.readyState < 4) {
+                rafId = requestAnimationFrame(renderPrediction);
+                return;
+            }
+
+            const poses = await detector.estimatePoses(videoElement, { flipHorizontal: false });
+
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            canvasCtx.drawImage(videoElement, 0, 0, canvasElement.width, canvasElement.height);
+
+            if (poses && poses.length > 0) {
+                const keypoints = poses[0].keypoints;
+                drawSkeleton(keypoints); // 항상 스켈레톤은 그림
+
+                // 게임 로직 실행 (게임 활성화 & 포즈 확인 상태일 때)
+                if (isGameActive && checkingPose && currentCommand) {
+                    const isCorrectPose = classifyPoseExtended(keypoints, currentCommand);
+                    if (isCorrectPose) {
+                        poseSuccess(); // 성공 처리 및 다음 명령 준비
+                    }
+                }
+            } else {
+                // 사람이 감지되지 않으면 피드백 초기화 (옵션)
+                // if (isGameActive) feedbackArea.innerText = "사람을 감지할 수 없습니다.";
+            }
+
+            rafId = requestAnimationFrame(renderPrediction);
+        }
+
+        // --- 슬라이더 이벤트 리스너 설정 (동일) ---
+        function setupSliders() {
+             sittingThresholdSlider.addEventListener('input', (event) => {
+                sittingThresholdAngle = parseInt(event.target.value);
+                sittingThresholdValueSpan.textContent = sittingThresholdAngle;
+                if (sittingThresholdAngle >= standingThresholdAngle) {
+                     standingThresholdAngle = sittingThresholdAngle + 1; standingThresholdSlider.value = standingThresholdAngle; standingThresholdValueSpan.textContent = standingThresholdAngle;
+                }
+            });
+            standingThresholdSlider.addEventListener('input', (event) => {
+                standingThresholdAngle = parseInt(event.target.value);
+                standingThresholdValueSpan.textContent = standingThresholdAngle;
+                 if (standingThresholdAngle <= sittingThresholdAngle) {
+                     sittingThresholdAngle = standingThresholdAngle - 1; sittingThresholdSlider.value = sittingThresholdAngle; sittingThresholdValueSpan.textContent = sittingThresholdAngle;
+                 }
+            });
+            // 초기 값 설정
+            sittingThresholdSlider.value = sittingThresholdAngle; sittingThresholdValueSpan.textContent = sittingThresholdAngle;
+            standingThresholdSlider.value = standingThresholdAngle; standingThresholdValueSpan.textContent = standingThresholdAngle;
+        }
+
+        // --- 게임 버튼 이벤트 리스너 ---
+        function setupGameButton() {
+            gameButton.addEventListener('click', () => {
+                if (isGameActive) {
+                    stopGame();
+                } else {
+                    // TTS 사용 전 사용자 인터랙션 확인 (브라우저 정책)
+                    if (synth.paused) { // iOS 등에서 필요할 수 있음
+                        synth.resume();
+                    }
+                    startGame();
+                }
+            });
+        }
+
+        // --- 메인 실행 함수 ---
+        async function main() {
+            try {
+                await tf.setBackend('webgl');
+                setupSliders();
+                setupGameButton();
+                populateVoiceList(); // 초기 목소리 로딩 시도
+                await loadModel();
+                await setupWebcam();
+
+                loadingElement.style.display = 'none';
+                videoElement.play();
+                renderPrediction();
+
+            } catch (error) {
+                console.error("초기화 중 오류 발생:", error);
+                if (loadingElement.innerText.includes('로딩 중')) {
+                   loadingElement.innerText = "오류 발생. 콘솔 확인.";
+                }
+                 commandArea.innerText = '초기화 오류 발생!';
+                 feedbackArea.innerText = error.message || "콘솔을 확인하세요.";
+            }
+        }
+
+        // 프로그램 시작
+        main();
+
+        // 페이지 벗어날 때 정리
+        window.addEventListener('beforeunload', () => {
+            stopGame(); // 게임 상태 중지
+            if (rafId) cancelAnimationFrame(rafId);
+            if (detector) detector.dispose();
+            if (videoElement.srcObject) videoElement.srcObject.getTracks().forEach(track => track.stop());
+            synth.cancel(); // TTS 정리
+        });
+
+    </script>
+</body>
+</html>
