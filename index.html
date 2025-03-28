@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>실시간 자세 추정 (각도 조절 + 오디오 피드백)</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            margin: 0;
+            padding: 20px;
+            background-color: #f0f0f0;
+        }
+        h1 {
+            color: #333;
+        }
+        #container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 15px; /* 요소 간 간격 */
+        }
+        #liveView {
+            position: relative;
+            width: 640px;
+            height: 480px;
+            border: 1px solid #ccc;
+            background-color: #000;
+        }
+        #webcam {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            visibility: hidden;
+        }
+        #outputCanvas {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+        }
+        #loading {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            font-size: 1.2em; color: white; background-color: rgba(0, 0, 0, 0.7);
+            padding: 10px 20px; border-radius: 5px; z-index: 10;
+        }
+        .warning {
+            background-color: #fff3cd; color: #856404; padding: 15px;
+            border: 1px solid #ffeeba; border-radius: 5px;
+            max-width: 640px; text-align: center;
+        }
+        .pose-text {
+            position: absolute; top: 10px; left: 10px;
+            background-color: rgba(0, 0, 0, 0.6); color: white;
+            padding: 8px 12px; font-size: 1.5em; border-radius: 5px; z-index: 5;
+        }
+        /* 컨트롤 영역 스타일 */
+        #controls {
+            display: flex;
+            flex-direction: column; /* 세로 배치 */
+            align-items: stretch; /* 항목 너비 맞춤 */
+            gap: 10px; /* 컨트롤 간 간격 */
+            background-color: #e9e9e9;
+            padding: 15px;
+            border-radius: 8px;
+            width: 640px; /* 비디오 너비와 맞춤 */
+            box-sizing: border-box; /* 패딩 포함 너비 계산 */
+        }
+        .control-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .control-item label {
+            min-width: 130px; /* 레이블 너비 고정 */
+            text-align: right;
+        }
+        .control-item input[type="range"] {
+            flex-grow: 1; /* 남은 공간 차지 */
+        }
+        .control-item span {
+            min-width: 40px; /* 값 표시 너비 고정 */
+            text-align: right;
+            font-weight: bold;
+        }
+        /* 오디오 버튼 */
+        #audioButton {
+            padding: 10px 15px;
+            font-size: 1em;
+            cursor: pointer;
+            border: none;
+            border-radius: 5px;
+            background-color: #4CAF50; /* Green */
+            color: white;
+            transition: background-color 0.3s;
+        }
+         #audioButton:hover {
+            background-color: #45a049;
+        }
+        #audioButton.playing {
+            background-color: #f44336; /* Red */
+        }
+         #audioButton.playing:hover {
+            background-color: #da190b;
+        }
+    </style>
+    <!-- 라이브러리 로드 (동일) -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-converter"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection"></script>
+</head>
+<body>
+    <h1>실시간 자세 추정 (각도 조절 + 오디오 피드백)</h1>
+
+    <div class="warning">
+        <strong>주의:</strong> 사람 자세 추정 모델(MoveNet) 사용 중입니다.<br>
+        슬라이더로 '앉기'/'서기' 판별 각도를 조절하고, 오디오 버튼으로 소리 피드백을 켜거나 끌 수 있습니다.<br>
+        웹캠 및 오디오 권한이 필요합니다.
+    </div>
+
+    <div id="container">
+        <div id="liveView">
+            <video id="webcam" autoplay playsinline></video>
+            <canvas id="outputCanvas"></canvas>
+            <div id="loading">모델 및 웹캠 로딩 중...</div>
+            <div id="poseResult" class="pose-text" style="display: none;"></div>
+        </div>
+
+        <!-- 컨트롤 영역 -->
+        <div id="controls">
+            <div class="control-item">
+                <label for="sittingThreshold">앉기 판별 각도 (<):</label>
+                <input type="range" id="sittingThreshold" min="90" max="170" value="140">
+                <span id="sittingThresholdValue">140</span>°
+            </div>
+            <div class="control-item">
+                <label for="standingThreshold">서기 판별 각도 (>):</label>
+                <input type="range" id="standingThreshold" min="100" max="179" value="160">
+                <span id="standingThresholdValue">160</span>°
+            </div>
+             <div class="control-item">
+                 <button id="audioButton">오디오 피드백 시작</button>
+                 <span>(Sitting: 낮음, Standing: 높음)</span>
+             </div>
+        </div>
+    </div>
+
+    <script>
+        // --- DOM 요소 가져오기 ---
+        const videoElement = document.getElementById('webcam');
+        const canvasElement = document.getElementById('outputCanvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const loadingElement = document.getElementById('loading');
+        const poseResultElement = document.getElementById('poseResult');
+        const sittingThresholdSlider = document.getElementById('sittingThreshold');
+        const sittingThresholdValueSpan = document.getElementById('sittingThresholdValue');
+        const standingThresholdSlider = document.getElementById('standingThreshold');
+        const standingThresholdValueSpan = document.getElementById('standingThresholdValue');
+        const audioButton = document.getElementById('audioButton');
+
+        // --- 전역 변수 ---
+        let detector;
+        let rafId;
+        let sittingThresholdAngle = 140; // 기본값
+        let standingThresholdAngle = 160; // 기본값
+
+        // --- Web Audio API 변수 ---
+        let audioContext;
+        let oscillator;
+        let gainNode;
+        let isAudioPlaying = false;
+        const SITTING_FREQ = 261.63; // C4 (낮은 도)
+        const STANDING_FREQ = 523.25; // C5 (높은 도)
+        const VOLUME = 0.1; // 사인파 볼륨 (너무 크지 않게)
+
+        // --- 모델 및 키포인트 설정 (동일) ---
+        const detectorConfig = { modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING, enableSmoothing: true };
+        const KEYPOINTS = { /* ... 이전 코드와 동일 ... */
+             NOSE: 0, LEFT_EYE: 1, RIGHT_EYE: 2, LEFT_EAR: 3, RIGHT_EAR: 4,
+            LEFT_SHOULDER: 5, RIGHT_SHOULDER: 6, LEFT_ELBOW: 7, RIGHT_ELBOW: 8,
+            LEFT_WRIST: 9, RIGHT_WRIST: 10, LEFT_HIP: 11, RIGHT_HIP: 12,
+            LEFT_KNEE: 13, RIGHT_KNEE: 14, LEFT_ANKLE: 15, RIGHT_ANKLE: 16
+        };
+        const connections = poseDetection.util.getAdjacentPairs(poseDetection.SupportedModels.MoveNet);
+
+        // --- 함수들 ---
+
+        // 웹캠 설정 (동일)
+        async function setupWebcam() { /* ... 이전 코드와 동일 ... */
+            return new Promise((resolve, reject) => {
+                navigator.mediaDevices.getUserMedia({ video: true })
+                    .then(stream => {
+                        videoElement.srcObject = stream;
+                        videoElement.addEventListener('loadeddata', () => {
+                            canvasElement.width = videoElement.videoWidth;
+                            canvasElement.height = videoElement.videoHeight;
+                            resolve();
+                        });
+                    })
+                    .catch(err => {
+                        console.error("웹캠 접근 오류:", err);
+                        loadingElement.innerText = "웹캠 접근 실패. 권한을 확인하세요.";
+                        reject(err);
+                    });
+            });
+        }
+
+        // 모델 로드 (동일)
+        async function loadModel() { /* ... 이전 코드와 동일 ... */
+             try {
+                detector = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, detectorConfig);
+                console.log("MoveNet 모델 로드 완료.");
+            } catch (error) {
+                console.error("모델 로드 오류:", error);
+                loadingElement.innerText = "모델 로드 실패.";
+                throw error;
+            }
+        }
+
+        // 키포인트/스켈레톤 그리기 (동일)
+        function drawKeypoint(keypoint) { /* ... 이전 코드와 동일 ... */
+             if (keypoint.score > 0.3) {
+                const radius = 5;
+                canvasCtx.beginPath();
+                canvasCtx.arc(keypoint.x, keypoint.y, radius, 0, 2 * Math.PI);
+                canvasCtx.fillStyle = 'aqua';
+                canvasCtx.fill();
+            }
+         }
+        function drawSkeleton(keypoints) { /* ... 이전 코드와 동일 ... */
+             canvasCtx.fillStyle = 'aqua';
+            canvasCtx.strokeStyle = 'lime';
+            canvasCtx.lineWidth = 2;
+            keypoints.forEach(keypoint => drawKeypoint(keypoint));
+            connections.forEach((pair) => {
+                const [i, j] = pair;
+                const kp1 = keypoints[i];
+                const kp2 = keypoints[j];
+                if (kp1.score > 0.3 && kp2.score > 0.3) {
+                    canvasCtx.beginPath();
+                    canvasCtx.moveTo(kp1.x, kp1.y);
+                    canvasCtx.lineTo(kp2.x, kp2.y);
+                    canvasCtx.stroke();
+                }
+            });
+        }
+
+        // 각도 계산 (동일)
+        function calculateAngle(a, b, c) { /* ... 이전 코드와 동일 ... */
+            const baX = a.x - b.x; const baY = a.y - b.y;
+            const bcX = c.x - b.x; const bcY = c.y - b.y;
+            const dotProduct = baX * bcX + baY * bcY;
+            const magnitudeBA = Math.sqrt(baX * baX + baY * baY);
+            const magnitudeBC = Math.sqrt(bcX * bcX + bcY * bcY);
+            if (magnitudeBA === 0 || magnitudeBC === 0) return null;
+            const cosTheta = dotProduct / (magnitudeBA * magnitudeBC);
+            const clampedCosTheta = Math.max(-1.0, Math.min(1.0, cosTheta));
+            return Math.acos(clampedCosTheta) * (180 / Math.PI);
+         }
+
+        // 자세 분류 함수 (임계값 변수 사용)
+        function classifyPose(keypoints) {
+            const confidenceThreshold = 0.3;
+            const requiredKeypoints = [
+                KEYPOINTS.LEFT_SHOULDER, KEYPOINTS.RIGHT_SHOULDER, KEYPOINTS.LEFT_HIP, KEYPOINTS.RIGHT_HIP,
+                KEYPOINTS.LEFT_KNEE, KEYPOINTS.RIGHT_KNEE, KEYPOINTS.LEFT_ANKLE, KEYPOINTS.RIGHT_ANKLE
+            ];
+            if (requiredKeypoints.some(idx => keypoints[idx].score < confidenceThreshold)) {
+                //console.log("필수 키포인트 신뢰도 부족");
+                return null;
+            }
+
+            const leftShoulder = keypoints[KEYPOINTS.LEFT_SHOULDER];
+            const rightShoulder = keypoints[KEYPOINTS.RIGHT_SHOULDER];
+            const leftHip = keypoints[KEYPOINTS.LEFT_HIP];
+            const rightHip = keypoints[KEYPOINTS.RIGHT_HIP];
+            const leftKnee = keypoints[KEYPOINTS.LEFT_KNEE];
+            const rightKnee = keypoints[KEYPOINTS.RIGHT_KNEE];
+            const leftAnkle = keypoints[KEYPOINTS.LEFT_ANKLE];
+            const rightAnkle = keypoints[KEYPOINTS.RIGHT_ANKLE];
+
+            const avgShoulderY = (leftShoulder.y + rightShoulder.y) / 2;
+            const avgHipY = (leftHip.y + rightHip.y) / 2;
+            const isUpright = avgShoulderY < (avgHipY - 50);
+
+            if (isUpright) {
+                const leftKneeAngle = calculateAngle(leftHip, leftKnee, leftAnkle);
+                const rightKneeAngle = calculateAngle(rightHip, rightKnee, rightAnkle);
+                let avgKneeAngle = null;
+
+                if (leftKneeAngle !== null && rightKneeAngle !== null) {
+                    avgKneeAngle = (leftKneeAngle + rightKneeAngle) / 2;
+                } else if (leftKneeAngle !== null) avgKneeAngle = leftKneeAngle;
+                else if (rightKneeAngle !== null) avgKneeAngle = rightKneeAngle;
+
+                if (avgKneeAngle !== null) {
+                    // *** 조절된 임계값 사용 ***
+                    if (avgKneeAngle < sittingThresholdAngle) {
+                        return "Sitting 🧘";
+                    } else if (avgKneeAngle > standingThresholdAngle) {
+                        return "Standing🧍";
+                    }
+                }
+            }
+            return null; // 위 조건 외에는 판별 불가
+        }
+
+        // --- Web Audio API 설정 함수 ---
+        function setupAudio() {
+            try {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                oscillator = audioContext.createOscillator();
+                gainNode = audioContext.createGain();
+
+                oscillator.type = 'sine'; // 사인파
+                oscillator.frequency.setValueAtTime(SITTING_FREQ, audioContext.currentTime); // 초기 주파수 설정
+                gainNode.gain.setValueAtTime(0, audioContext.currentTime); // 초기 볼륨 0 (소리 안남)
+
+                oscillator.connect(gainNode);
+                gainNode.connect(audioContext.destination);
+                oscillator.start(); // 오실레이터 시작 (주파수/볼륨은 계속 조절 가능)
+                console.log("Web Audio API 초기화 완료.");
+            } catch (e) {
+                console.error("Web Audio API 초기화 실패:", e);
+                alert("오디오 컨텍스트를 생성할 수 없습니다. 브라우저가 Web Audio API를 지원하는지 확인하세요.");
+            }
+        }
+
+        // --- 오디오 제어 함수 ---
+        function controlAudio(pose) {
+            if (!audioContext || !isAudioPlaying) { // 오디오 컨텍스트 없거나, 사용자가 시작 안했으면 중지
+                 if (gainNode) gainNode.gain.setValueAtTime(0, audioContext.currentTime);
+                return;
+            }
+
+            const now = audioContext.currentTime;
+            if (pose === "Sitting 🧘") {
+                oscillator.frequency.linearRampToValueAtTime(SITTING_FREQ, now + 0.1); // 부드럽게 주파수 변경
+                gainNode.gain.linearRampToValueAtTime(VOLUME, now + 0.1); // 부드럽게 볼륨 켜기
+            } else if (pose === "Standing🧍") {
+                oscillator.frequency.linearRampToValueAtTime(STANDING_FREQ, now + 0.1);
+                gainNode.gain.linearRampToValueAtTime(VOLUME, now + 0.1);
+            } else {
+                gainNode.gain.linearRampToValueAtTime(0, now + 0.1); // 소리 끄기
+            }
+        }
+
+        // --- 실시간 감지 및 그리기 루프 ---
+        async function renderPrediction() {
+            if (!detector || videoElement.readyState < 4) { // videoElement.readyState === 4 대신 < 4 로 확인
+                rafId = requestAnimationFrame(renderPrediction);
+                return;
+            }
+
+            const poses = await detector.estimatePoses(videoElement, { flipHorizontal: false });
+
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            canvasCtx.drawImage(videoElement, 0, 0, canvasElement.width, canvasElement.height);
+
+            let currentPose = null;
+
+            if (poses && poses.length > 0) {
+                const keypoints = poses[0].keypoints;
+                drawSkeleton(keypoints);
+                currentPose = classifyPose(keypoints);
+            }
+
+            // 자세 결과 시각화
+            if (currentPose) {
+                poseResultElement.innerText = currentPose;
+                poseResultElement.style.display = 'block';
+            } else {
+                poseResultElement.style.display = 'none';
+            }
+
+            // 오디오 피드백 제어
+            controlAudio(currentPose);
+
+            rafId = requestAnimationFrame(renderPrediction);
+        }
+
+        // --- 슬라이더 이벤트 리스너 설정 ---
+        function setupSliders() {
+            sittingThresholdSlider.addEventListener('input', (event) => {
+                sittingThresholdAngle = parseInt(event.target.value);
+                sittingThresholdValueSpan.textContent = sittingThresholdAngle;
+                // 서기 값보다 작도록 강제 (옵션)
+                if (sittingThresholdAngle >= standingThresholdAngle) {
+                     standingThresholdAngle = sittingThresholdAngle + 1;
+                     standingThresholdSlider.value = standingThresholdAngle;
+                     standingThresholdValueSpan.textContent = standingThresholdAngle;
+                }
+            });
+
+            standingThresholdSlider.addEventListener('input', (event) => {
+                standingThresholdAngle = parseInt(event.target.value);
+                standingThresholdValueSpan.textContent = standingThresholdAngle;
+                 // 앉기 값보다 크도록 강제 (옵션)
+                 if (standingThresholdAngle <= sittingThresholdAngle) {
+                     sittingThresholdAngle = standingThresholdAngle - 1;
+                     sittingThresholdSlider.value = sittingThresholdAngle;
+                     sittingThresholdValueSpan.textContent = sittingThresholdAngle;
+                 }
+            });
+
+             // 초기 슬라이더 값 설정
+            sittingThresholdSlider.value = sittingThresholdAngle;
+            sittingThresholdValueSpan.textContent = sittingThresholdAngle;
+            standingThresholdSlider.value = standingThresholdAngle;
+            standingThresholdValueSpan.textContent = standingThresholdAngle;
+        }
+
+        // --- 오디오 버튼 이벤트 리스너 ---
+        function setupAudioButton() {
+             audioButton.addEventListener('click', () => {
+                 if (!audioContext) { // 오디오 컨텍스트가 아직 없으면 생성 시도
+                     setupAudio();
+                     if (!audioContext) return; // 생성 실패 시 중단
+                 }
+
+                 // 오디오 컨텍스트 상태 확인 및 재개 (사용자 인터랙션 후 필요할 수 있음)
+                 if (audioContext.state === 'suspended') {
+                     audioContext.resume();
+                 }
+
+                 isAudioPlaying = !isAudioPlaying; // 재생 상태 토글
+
+                 if (isAudioPlaying) {
+                     audioButton.textContent = '오디오 피드백 중지';
+                     audioButton.classList.add('playing');
+                     // controlAudio 함수가 renderPrediction 루프에서 호출되므로 여기서 바로 gain을 설정할 필요는 없음
+                 } else {
+                     audioButton.textContent = '오디오 피드백 시작';
+                     audioButton.classList.remove('playing');
+                     // 즉시 소리 끄기
+                     if(gainNode) gainNode.gain.setValueAtTime(0, audioContext.currentTime);
+                 }
+             });
+        }
+
+
+        // --- 메인 실행 함수 ---
+        async function main() {
+            try {
+                await tf.setBackend('webgl');
+                setupSliders(); // 슬라이더 설정 먼저
+                setupAudioButton(); // 오디오 버튼 설정
+                // setupAudio(); // 오디오는 버튼 클릭 시 초기화하도록 변경
+                await loadModel();
+                await setupWebcam();
+
+                loadingElement.style.display = 'none';
+                videoElement.play();
+                renderPrediction();
+
+            } catch (error) {
+                console.error("초기화 중 오류 발생:", error);
+                if (loadingElement.innerText.includes('로딩 중')) {
+                   loadingElement.innerText = "오류 발생. 콘솔 확인.";
+                }
+            }
+        }
+
+        // 프로그램 시작
+        main();
+
+        // 페이지 벗어날 때 정리
+        window.addEventListener('beforeunload', () => {
+            if (rafId) cancelAnimationFrame(rafId);
+            if (detector) detector.dispose();
+            if (videoElement.srcObject) videoElement.srcObject.getTracks().forEach(track => track.stop());
+            // 오디오 컨텍스트 종료
+            if (audioContext) {
+                oscillator.stop();
+                audioContext.close();
+            }
+        });
+
+    </script>
+</body>
+</html>
