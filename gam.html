@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pose Challenge Game!</title>
+    <style>
+        body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; margin: 0; padding: 15px; background-color: #f0f0f0; }
+        h1 { color: #333; margin-bottom: 10px; }
+        #container { display: flex; flex-direction: column; align-items: center; gap: 10px; width: 100%; max-width: 700px; /* 전체 너비 조절 */}
+
+        /* Game Status Area */
+        #gameStatus { display: flex; justify-content: space-between; width: 100%; max-width: 640px; background-color: #424242; color: white; padding: 10px 15px; border-radius: 8px; box-sizing: border-box; margin-bottom: 10px; font-size: 1.1em; }
+        #gameStatus > div { flex-basis: 30%; text-align: center; }
+        #scoreArea, #timerArea, #missesArea { font-weight: bold; }
+        #timerArea span { color: #ffeb3b; /* Yellow */}
+        #missesArea span { color: #ff5252; /* Red */}
+
+        /* Command & Feedback Area */
+        #gameUI { width: 100%; max-width: 640px; background-color: #e0f2f7; padding: 15px; border-radius: 8px; box-sizing: border-box; text-align: center; }
+        #commandArea { font-size: 1.7em; font-weight: bold; color: #006064; min-height: 45px; display: flex; align-items: center; justify-content: center; }
+        #feedbackArea { font-size: 1.1em; color: #d32f2f; margin-top: 5px; min-height: 22px; font-style: italic; }
+        #gameButton { padding: 10px 18px; font-size: 1em; cursor: pointer; border: none; border-radius: 5px; background-color: #009688; color: white; transition: background-color 0.3s; margin-top: 10px; }
+        #gameButton:hover { background-color: #00796b; }
+        #gameButton.active { background-color: #f44336; }
+        #gameButton.active:hover { background-color: #d32f2f; }
+
+        /* Video & Canvas Area */
+        #liveView { position: relative; width: 100%; max-width: 640px; height: auto; aspect-ratio: 640 / 480; /* 비율 유지 */ border: 1px solid #ccc; background-color: #000; overflow: hidden; /* 내부 요소가 넘치지 않게 */}
+        #webcam, #outputCanvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; /* 비율 유지하며 채우기 */}
+        #webcam { visibility: hidden; }
+        #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 1.2em; color: white; background-color: rgba(0, 0, 0, 0.7); padding: 10px 20px; border-radius: 5px; z-index: 10; text-align: center; }
+
+        /* Controls Area (Sliders) */
+        #controls { display: flex; flex-direction: column; gap: 10px; background-color: #eeeeee; padding: 15px; border-radius: 8px; width: 100%; max-width: 640px; box-sizing: border-box; margin-top: 10px;}
+        #controls p { text-align: center; margin: 0 0 10px 0; font-weight: bold; color: #555; }
+        .control-item { display: flex; align-items: center; gap: 10px; }
+        .control-item label { min-width: 140px; text-align: right; font-size: 0.9em; color: #666; }
+        .control-item input[type="range"] { flex-grow: 1; cursor: pointer;}
+        .control-item span { min-width: 35px; text-align: right; font-weight: bold; font-size: 0.9em; color: #333; }
+    </style>
+    <!-- TF.js Libraries -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-converter"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection"></script>
+</head>
+<body>
+    <h1>Pose Challenge Game!</h1>
+
+    <div id="container">
+        <!-- Game Status Display -->
+        <div id="gameStatus">
+            <div id="scoreArea">Score: 0</div>
+            <div id="timerArea">Time: --</div>
+            <div id="missesArea">Misses: <span>0 / 3</span></div>
+        </div>
+
+        <!-- Command & Feedback -->
+        <div id="gameUI">
+            <div id="commandArea">Press START GAME!</div>
+            <div id="feedbackArea"></div>
+            <button id="gameButton">Start Game</button>
+        </div>
+
+        <!-- Video Feed & Canvas -->
+        <div id="liveView">
+            <video id="webcam" autoplay playsinline></video>
+            <canvas id="outputCanvas"></canvas>
+            <div id="loading">Loading Model & Webcam...</div>
+        </div>
+
+        <!-- Angle Controls (for tuning) -->
+        <div id="controls">
+             <p>Pose Detection Angle Thresholds (for tuning)</p>
+            <div class="control-item">
+                <label for="sittingThreshold">Sit Angle (<):</label>
+                <input type="range" id="sittingThreshold" min="90" max="170" value="140">
+                <span id="sittingThresholdValue">140</span>°
+            </div>
+            <div class="control-item">
+                <label for="standingThreshold">Stand Angle (>):</label>
+                <input type="range" id="standingThreshold" min="100" max="179" value="160">
+                <span id="standingThresholdValue">160</span>°
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- DOM Elements ---
+        const videoElement = document.getElementById('webcam');
+        const canvasElement = document.getElementById('outputCanvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const loadingElement = document.getElementById('loading');
+        const commandArea = document.getElementById('commandArea');
+        const feedbackArea = document.getElementById('feedbackArea');
+        const gameButton = document.getElementById('gameButton');
+        const scoreArea = document.getElementById('scoreArea');
+        const timerArea = document.getElementById('timerArea');
+        const missesArea = document.getElementById('missesArea').querySelector('span'); // Span for number
+        const sittingThresholdSlider = document.getElementById('sittingThreshold');
+        const sittingThresholdValueSpan = document.getElementById('sittingThresholdValue');
+        const standingThresholdSlider = document.getElementById('standingThreshold');
+        const standingThresholdValueSpan = document.getElementById('standingThresholdValue');
+
+        // --- Global Variables ---
+        let detector;
+        let rafId;
+        let sittingThresholdAngle = 140;
+        let standingThresholdAngle = 160;
+
+        // --- Game State Variables ---
+        const GAME_STATE = { IDLE: 0, STARTING: 1, COMMAND_GIVEN: 2, CHECKING_POSE: 3, SUCCESS: 4, GAME_OVER: 5 };
+        let currentGameState = GAME_STATE.IDLE;
+        let currentCommand = null;
+        let score = 0;
+        let misses = 0;
+        const MAX_MISSES = 3;
+        let timerIntervalId = null;
+        let timeLeft = 0;
+        const BASE_TIME_LIMIT = 8; // seconds per command (initial)
+        let poseCheckTimeoutId = null; // Timeout before starting pose check
+        let nextCommandTimeoutId = null; // Timeout before next command
+        let poseSuccessThisRound = false; // Flag to prevent multiple successes
+
+        const commands = ["Sit", "Stand", "Left hand up", "Right hand up", "Both hands up"];
+        const poseSuccessMessages = ["Great job!", "Awesome!", "You got it!", "Perfect!", "Well done!"];
+        const timeUpMessages = ["Time's up!", "Too slow!", "Try faster next time!"];
+
+        // --- Web Speech API (TTS) ---
+        const synth = window.speechSynthesis;
+
+        // --- Model Config (MultiPose) & Keypoints ---
+        // Using MULTILIGHTNING for better performance with multiple people
+        const detectorConfig = {
+            modelType: poseDetection.movenet.modelType.MULTIPOSE_LIGHTNING,
+            enableSmoothing: true,
+            multiPoseMaxDimension: 256 // Lower dimension for faster processing
+            // You might need to adjust maxPoses if needed, default is 5
+        };
+        const KEYPOINTS = { /* ... same as before ... */
+             NOSE: 0, LEFT_EYE: 1, RIGHT_EYE: 2, LEFT_EAR: 3, RIGHT_EAR: 4,
+            LEFT_SHOULDER: 5, RIGHT_SHOULDER: 6, LEFT_ELBOW: 7, RIGHT_ELBOW: 8,
+            LEFT_WRIST: 9, RIGHT_WRIST: 10, LEFT_HIP: 11, RIGHT_HIP: 12,
+            LEFT_KNEE: 13, RIGHT_KNEE: 14, LEFT_ANKLE: 15, RIGHT_ANKLE: 16
+        };
+        const connections = poseDetection.util.getAdjacentPairs(poseDetection.SupportedModels.MoveNet);
+        const confidenceThreshold = 0.3;
+
+        // --- Utility Functions ---
+        function getRandomElement(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+
+        // --- TTS Function (English) ---
+        function speak(text, onEndCallback = null) {
+            if (synth.speaking) {
+                // synth.cancel(); // Option: Cancel previous speech
+                return; // Prevent overlapping speech for simplicity
+            }
+            const utterThis = new SpeechSynthesisUtterance(text);
+            utterThis.lang = 'en-US'; // Set language to English
+            utterThis.pitch = 1;
+            utterThis.rate = 1; // Adjust rate if needed
+            utterThis.onend = function (event) { if (onEndCallback) onEndCallback(); }
+            utterThis.onerror = function (event) { console.error('SpeechSynthesis Error', event); }
+            synth.speak(utterThis);
+        }
+
+        // --- Drawing Functions ---
+        function drawKeypoint(keypoint, color = 'aqua') {
+            if (keypoint.score > confidenceThreshold) {
+                const radius = 5; canvasCtx.beginPath();
+                canvasCtx.arc(keypoint.x, keypoint.y, radius, 0, 2 * Math.PI);
+                canvasCtx.fillStyle = color; canvasCtx.fill();
+            }
+        }
+        function drawSkeleton(keypoints, color = 'lime') {
+            canvasCtx.strokeStyle = color; canvasCtx.lineWidth = 2;
+            // Draw connections
+            connections.forEach((pair) => {
+                const [i, j] = pair; const kp1 = keypoints[i]; const kp2 = keypoints[j];
+                if (kp1.score > confidenceThreshold && kp2.score > confidenceThreshold) {
+                    canvasCtx.beginPath(); canvasCtx.moveTo(kp1.x, kp1.y); canvasCtx.lineTo(kp2.x, kp2.y); canvasCtx.stroke();
+                }
+            });
+            // Draw keypoints over connections
+            keypoints.forEach(keypoint => drawKeypoint(keypoint, color === 'lime' ? 'aqua' : color)); // Use slightly different color for points
+        }
+
+        // --- Pose Classification & Angle Calculation ---
+        function calculateAngle(a, b, c) { /* ... same as before ... */
+            const baX = a.x - b.x; const baY = a.y - b.y; const bcX = c.x - b.x; const bcY = c.y - b.y;
+            const dotProduct = baX * bcX + baY * bcY;
+            const magnitudeBA = Math.sqrt(baX * baX + baY * baY); const magnitudeBC = Math.sqrt(bcX * bcX + bcY * bcY);
+            if (magnitudeBA === 0 || magnitudeBC === 0) return null;
+            const cosTheta = dotProduct / (magnitudeBA * magnitudeBC);
+            const clampedCosTheta = Math.max(-1.0, Math.min(1.0, cosTheta));
+            return Math.acos(clampedCosTheta) * (180 / Math.PI);
+        }
+
+        // Classify pose for a SINGLE person's keypoints
+        function checkSinglePose(keypoints, targetCommand) {
+            if (!targetCommand) return false;
+
+            const getKp = (idx) => keypoints[idx] || { score: 0 }; // Helper to safely get keypoint
+
+             // Check confidence of required keypoints for the specific command
+            let requiredIndices = [];
+            if (targetCommand === "Sit" || targetCommand === "Stand") {
+                requiredIndices = [KEYPOINTS.LEFT_SHOULDER, KEYPOINTS.RIGHT_SHOULDER, KEYPOINTS.LEFT_HIP, KEYPOINTS.RIGHT_HIP, KEYPOINTS.LEFT_KNEE, KEYPOINTS.RIGHT_KNEE, KEYPOINTS.LEFT_ANKLE, KEYPOINTS.RIGHT_ANKLE];
+            } else if (targetCommand.includes("hand up")) {
+                requiredIndices = [KEYPOINTS.LEFT_SHOULDER, KEYPOINTS.RIGHT_SHOULDER, KEYPOINTS.LEFT_ELBOW, KEYPOINTS.RIGHT_ELBOW, KEYPOINTS.LEFT_WRIST, KEYPOINTS.RIGHT_WRIST];
+            }
+             if (requiredIndices.some(idx => getKp(idx).score < confidenceThreshold)) {
+                 // console.log(`Insufficient keypoint confidence for ${targetCommand}`);
+                 return false;
+             }
+
+            // --- Sit / Stand Logic ---
+            if (targetCommand === "Sit" || targetCommand === "Stand") {
+                const leftShoulder = getKp(KEYPOINTS.LEFT_SHOULDER), rightShoulder = getKp(KEYPOINTS.RIGHT_SHOULDER);
+                const leftHip = getKp(KEYPOINTS.LEFT_HIP), rightHip = getKp(KEYPOINTS.RIGHT_HIP);
+                const leftKnee = getKp(KEYPOINTS.LEFT_KNEE), rightKnee = getKp(KEYPOINTS.RIGHT_KNEE);
+                const leftAnkle = getKp(KEYPOINTS.LEFT_ANKLE), rightAnkle = getKp(KEYPOINTS.RIGHT_ANKLE);
+
+                const avgShoulderY = (leftShoulder.y + rightShoulder.y) / 2;
+                const avgHipY = (leftHip.y + rightHip.y) / 2;
+                const isUpright = avgShoulderY < (avgHipY - 50); // Rough check for being upright
+
+                if (isUpright) {
+                    const leftKneeAngle = calculateAngle(leftHip, leftKnee, leftAnkle);
+                    const rightKneeAngle = calculateAngle(rightHip, rightKnee, rightAnkle);
+                    let avgKneeAngle = [leftKneeAngle, rightKneeAngle].filter(a => a !== null).reduce((sum, a, _, arr) => sum + a / arr.length, 0);
+
+                    if (avgKneeAngle > 0) { // Check if angle calculation was possible
+                        if (targetCommand === "Sit" && avgKneeAngle < sittingThresholdAngle) return true;
+                        if (targetCommand === "Stand" && avgKneeAngle > standingThresholdAngle) return true;
+                    }
+                }
+                return false;
+            }
+
+            // --- Hand Up Logic ---
+            if (targetCommand.includes("hand up")) {
+                const leftShoulder = getKp(KEYPOINTS.LEFT_SHOULDER), rightShoulder = getKp(KEYPOINTS.RIGHT_SHOULDER);
+                const leftElbow = getKp(KEYPOINTS.LEFT_ELBOW), rightElbow = getKp(KEYPOINTS.RIGHT_ELBOW);
+                const leftWrist = getKp(KEYPOINTS.LEFT_WRIST), rightWrist = getKp(KEYPOINTS.RIGHT_WRIST);
+
+                // Hand is up if wrist is significantly above shoulder AND elbow
+                const wristShoulderThreshold = 30; // Pixels
+                const wristElbowThreshold = 10; // Pixels
+
+                const isLeftHandUp = leftWrist.y < leftShoulder.y - wristShoulderThreshold && leftWrist.y < leftElbow.y - wristElbowThreshold;
+                const isRightHandUp = rightWrist.y < rightShoulder.y - wristShoulderThreshold && rightWrist.y < rightElbow.y - wristElbowThreshold;
+
+                if (targetCommand === "Left hand up") return isLeftHandUp && !isRightHandUp;
+                if (targetCommand === "Right hand up") return isRightHandUp && !isLeftHandUp;
+                if (targetCommand === "Both hands up") return isLeftHandUp && isRightHandUp;
+            }
+
+            return false; // Command not recognized or pose incorrect
+        }
+
+        // --- Game Logic Functions ---
+        function updateTimerDisplay() {
+            timerArea.textContent = `Time: ${timeLeft}s`;
+        }
+
+        function startTimer() {
+            // Decrease time limit slightly as score increases (simple difficulty scaling)
+            const timeLimit = Math.max(3, BASE_TIME_LIMIT - Math.floor(score / 5)); // Min 3 seconds
+            timeLeft = timeLimit;
+            updateTimerDisplay();
+            feedbackArea.innerText = ""; // Clear previous feedback
+
+            clearInterval(timerIntervalId); // Clear any existing timer
+            timerIntervalId = setInterval(() => {
+                timeLeft--;
+                updateTimerDisplay();
+                if (timeLeft <= 0) {
+                    handleMiss("Time's up!");
+                } else if (timeLeft <= 3) { // Play ticking sound for last 3 seconds (optional)
+                    // You could add a short sound effect here
+                    timerArea.style.color = '#ff5252'; // Turn red
+                }
+            }, 1000);
+             timerArea.style.color = '#ffeb3b'; // Reset color to yellow
+        }
+
+        function stopTimer() {
+            clearInterval(timerIntervalId);
+            timerIntervalId = null;
+            timerArea.style.color = '#ffeb3b'; // Reset color
+        }
+
+        function handleMiss(reason) {
+            if (currentGameState !== GAME_STATE.CHECKING_POSE) return; // Avoid multiple misses
+
+            stopTimer();
+            clearTimeout(poseCheckTimeoutId);
+            clearTimeout(nextCommandTimeoutId);
+            currentGameState = GAME_STATE.IDLE; // Temporarily idle before next command or game over
+
+            misses++;
+            missesArea.textContent = `${misses} / ${MAX_MISSES}`;
+            feedbackArea.innerText = reason || getRandomElement(timeUpMessages);
+            speak(reason || getRandomElement(timeUpMessages));
+
+            if (misses >= MAX_MISSES) {
+                gameOver();
+            } else {
+                // Schedule next command after a short delay
+                nextCommandTimeoutId = setTimeout(nextCommand, 2000); // 2s delay after miss
+            }
+        }
+
+        function checkPoseSuccess(poses) {
+            // Only check if in the correct state and haven't succeeded this round yet
+             if (currentGameState !== GAME_STATE.CHECKING_POSE || poseSuccessThisRound) {
+                 return;
+             }
+
+             // Check if ANY detected person performs the correct pose
+            let success = false;
+            for (const pose of poses) {
+                if (pose.score > 0.2) { // Only consider poses with reasonable confidence
+                    if (checkSinglePose(pose.keypoints, currentCommand)) {
+                        success = true;
+                        break; // Found a success, no need to check others
+                    }
+                }
+            }
+
+            if (success) {
+                poseSuccessThisRound = true; // Mark success for this round
+                stopTimer();
+                clearTimeout(poseCheckTimeoutId);
+                clearTimeout(nextCommandTimeoutId);
+                currentGameState = GAME_STATE.SUCCESS;
+
+                score++;
+                scoreArea.textContent = `Score: ${score}`;
+                const successMsg = getRandomElement(poseSuccessMessages);
+                feedbackArea.innerText = successMsg;
+                feedbackArea.style.color = '#4CAF50'; // Green for success
+                speak(successMsg, () => {
+                    // Schedule next command after success feedback
+                    currentGameState = GAME_STATE.IDLE; // Ready for next command
+                    nextCommandTimeoutId = setTimeout(nextCommand, 1500); // 1.5s delay after success
+                });
+            }
+             // If no success, the timer will eventually call handleMiss
+        }
+
+
+        function nextCommand() {
+            clearTimeout(nextCommandTimeoutId); // Clear previous scheduled command
+            clearTimeout(poseCheckTimeoutId);
+            stopTimer(); // Ensure timer is stopped
+
+            if (currentGameState === GAME_STATE.GAME_OVER) return;
+
+            currentGameState = GAME_STATE.COMMAND_GIVEN;
+            poseSuccessThisRound = false; // Reset success flag
+            currentCommand = getRandomElement(commands);
+            commandArea.innerText = `DO: "${currentCommand}"`;
+            feedbackArea.innerText = "";
+            feedbackArea.style.color = '#d32f2f'; // Reset feedback color
+
+            speak(`Now, ${currentCommand}!`, () => {
+                 // Start the timer and pose checking shortly after TTS finishes
+                startTimer();
+                 // Add a small delay before actually checking the pose
+                 poseCheckTimeoutId = setTimeout(() => {
+                     if (currentGameState === GAME_STATE.COMMAND_GIVEN) { // Ensure game hasn't ended/missed already
+                        currentGameState = GAME_STATE.CHECKING_POSE;
+                     }
+                 }, 500); // 0.5s delay before checking starts
+            });
+        }
+
+        function gameOver() {
+            currentGameState = GAME_STATE.GAME_OVER;
+            stopTimer();
+            clearTimeout(poseCheckTimeoutId);
+            clearTimeout(nextCommandTimeoutId);
+            rafId = null; // Stop animation loop implicitly by not requesting next frame
+
+            commandArea.innerText = "GAME OVER!";
+            const finalMsg = `Game Over! Your final score is ${score}.`;
+            feedbackArea.innerText = finalMsg;
+            feedbackArea.style.color = '#d32f2f';
+            speak(finalMsg);
+
+            gameButton.textContent = 'Start Game';
+            gameButton.classList.remove('active');
+        }
+
+        function resetGame() {
+            score = 0;
+            misses = 0;
+            scoreArea.textContent = `Score: ${score}`;
+            missesArea.textContent = `${misses} / ${MAX_MISSES}`;
+            timerArea.textContent = `Time: --`;
+            commandArea.innerText = 'Press START GAME!';
+            feedbackArea.innerText = '';
+            currentCommand = null;
+            stopTimer();
+            clearTimeout(poseCheckTimeoutId);
+            clearTimeout(nextCommandTimeoutId);
+            poseSuccessThisRound = false;
+            currentGameState = GAME_STATE.IDLE;
+             // Ensure animation loop restarts if stopped by game over
+             if (!rafId) {
+                 renderPrediction();
+             }
+        }
+
+
+        function startGame() {
+            if (currentGameState !== GAME_STATE.IDLE && currentGameState !== GAME_STATE.GAME_OVER) return;
+
+            resetGame(); // Reset all variables
+            currentGameState = GAME_STATE.STARTING;
+            gameButton.textContent = 'Stop Game';
+            gameButton.classList.add('active');
+            commandArea.innerText = "Get Ready...";
+
+            // Resume Audio Context if suspended (important for some browsers)
+             if (synth.paused) synth.resume();
+             // A small initial sound/speech to ensure audio context is active
+             speak("Get ready!", () => {
+                 nextCommandTimeoutId = setTimeout(nextCommand, 1000); // Start first command after 1s
+             });
+        }
+
+        function stopGame() {
+            if (currentGameState === GAME_STATE.IDLE || currentGameState === GAME_STATE.GAME_OVER) return;
+
+            currentGameState = GAME_STATE.IDLE; // Set to idle, effectively stopping checks
+            stopTimer();
+            clearTimeout(poseCheckTimeoutId);
+            clearTimeout(nextCommandTimeoutId);
+            synth.cancel(); // Stop any ongoing speech
+
+            gameButton.textContent = 'Start Game';
+            gameButton.classList.remove('active');
+            commandArea.innerText = 'Game Stopped.';
+            feedbackArea.innerText = '';
+            timerArea.textContent = `Time: --`;
+            currentCommand = null;
+        }
+
+
+        // --- Main Rendering Loop ---
+        async function renderPrediction() {
+             if (!detector || videoElement.readyState < 4 || currentGameState === GAME_STATE.GAME_OVER) {
+                 // Only request next frame if needed
+                 if(currentGameState !== GAME_STATE.GAME_OVER) {
+                     rafId = requestAnimationFrame(renderPrediction);
+                 } else {
+                     rafId = null; // Stop loop on game over
+                 }
+                return;
+            }
+
+            let poses = null;
+            try {
+                 poses = await detector.estimatePoses(videoElement, {
+                    flipHorizontal: false,
+                    maxPoses: 5 // Limit max detections if needed
+                 });
+            } catch (error) {
+                 console.error("Error estimating poses:", error);
+                 // Handle error appropriately, maybe stop the game
+            }
+
+
+            // --- Drawing ---
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            // Draw video feed first
+            canvasCtx.drawImage(videoElement, 0, 0, canvasElement.width, canvasElement.height);
+
+            // Define colors for multiple people (add more if needed)
+            const colors = ['lime', 'red', 'blue', 'yellow', 'magenta'];
+
+            if (poses && poses.length > 0) {
+                 // Draw skeleton for each detected person
+                poses.forEach((pose, index) => {
+                     if (pose.score > 0.2) { // Only draw reasonably confident poses
+                         drawSkeleton(pose.keypoints, colors[index % colors.length]);
+                     }
+                 });
+
+                // --- Game Logic Check ---
+                 // Check for success only if game is active and in the checking phase
+                 if (currentGameState === GAME_STATE.CHECKING_POSE) {
+                     checkPoseSuccess(poses);
+                 }
+
+            } else {
+                // Optional: Display feedback if no person is detected during gameplay
+                // if (currentGameState === GAME_STATE.CHECKING_POSE) {
+                //     feedbackArea.innerText = "Cannot detect anyone!";
+                // }
+            }
+
+            // Request next frame
+             if (currentGameState !== GAME_STATE.GAME_OVER) {
+                rafId = requestAnimationFrame(renderPrediction);
+            } else {
+                 rafId = null; // Ensure loop stops if game ended this frame
+            }
+        }
+
+        // --- Event Listeners & Initialization ---
+        function setupControls() {
+            // Sliders
+            sittingThresholdSlider.addEventListener('input', (event) => {
+                sittingThresholdAngle = parseInt(event.target.value);
+                sittingThresholdValueSpan.textContent = sittingThresholdAngle;
+                if (sittingThresholdAngle >= standingThresholdAngle) { standingThresholdAngle = sittingThresholdAngle + 1; standingThresholdSlider.value = standingThresholdAngle; standingThresholdValueSpan.textContent = standingThresholdAngle; }
+            });
+            standingThresholdSlider.addEventListener('input', (event) => {
+                standingThresholdAngle = parseInt(event.target.value);
+                standingThresholdValueSpan.textContent = standingThresholdAngle;
+                if (standingThresholdAngle <= sittingThresholdAngle) { sittingThresholdAngle = standingThresholdAngle - 1; sittingThresholdSlider.value = sittingThresholdAngle; sittingThresholdValueSpan.textContent = sittingThresholdAngle; }
+            });
+             // Initial values
+            sittingThresholdSlider.value = sittingThresholdAngle; sittingThresholdValueSpan.textContent = sittingThresholdAngle;
+            standingThresholdSlider.value = standingThresholdAngle; standingThresholdValueSpan.textContent = standingThresholdAngle;
+
+            // Game Button
+            gameButton.addEventListener('click', () => {
+                if (currentGameState === GAME_STATE.IDLE || currentGameState === GAME_STATE.GAME_OVER) {
+                    startGame();
+                } else {
+                    stopGame();
+                }
+            });
+        }
+
+         // Webcam Setup
+        async function setupWebcam() {
+             return new Promise((resolve, reject) => {
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    reject(new Error('Browser API navigator.mediaDevices.getUserMedia not available'));
+                    return;
+                }
+                navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } }) // Request specific size
+                    .then(stream => {
+                        videoElement.srcObject = stream;
+                        videoElement.addEventListener('loadeddata', () => {
+                            // Adjust canvas size dynamically based on video element size after loadeddata
+                             canvasElement.width = videoElement.clientWidth;
+                             canvasElement.height = videoElement.clientHeight;
+                             console.log(`Canvas resized to: ${canvasElement.width}x${canvasElement.height}`);
+                             resolve();
+                        });
+                    })
+                    .catch(err => {
+                        console.error("getUserMedia error:", err);
+                         loadingElement.innerText = "Webcam Error! Please grant permission and reload.";
+                        reject(err);
+                    });
+            });
+        }
+
+         // Model Loading
+         async function loadModelAndPoseDetector() {
+             try {
+                 // Ensure backend is set (WebGL is generally preferred)
+                 await tf.setBackend('webgl');
+                 console.log(`Using TF backend: ${tf.getBackend()}`);
+
+                 detector = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, detectorConfig);
+                 console.log("MoveNet MultiPose detector loaded successfully.");
+             } catch (error) {
+                 console.error("Failed to load the model or set backend:", error);
+                 loadingElement.innerText = "Model Loading Failed! Check console.";
+                 throw error; // Re-throw error to stop initialization
+             }
+         }
+
+
+        // --- Main Execution ---
+        async function main() {
+            setupControls(); // Setup sliders and button listener first
+
+            try {
+                 await loadModelAndPoseDetector(); // Load model
+                 await setupWebcam(); // Setup webcam
+
+                 loadingElement.style.display = 'none'; // Hide loading message
+                 videoElement.play(); // Start video playback
+                 renderPrediction(); // Start the main loop
+
+            } catch (error) {
+                 console.error("Initialization failed:", error);
+                 // Display error prominently if needed
+                 commandArea.innerText = "Initialization Error!";
+                 feedbackArea.innerText = "Could not start. Check console/permissions.";
+                 loadingElement.innerText = "Error! See console."; // Keep loading visible with error
+                 loadingElement.style.backgroundColor = "rgba(255, 0, 0, 0.7)"; // Make error obvious
+            }
+        }
+
+        // Start the application
+        main();
+
+        // Cleanup on page unload
+        window.addEventListener('beforeunload', () => {
+            stopGame();
+            if (rafId) cancelAnimationFrame(rafId);
+            if (detector) detector.dispose();
+            if (videoElement.srcObject) videoElement.srcObject.getTracks().forEach(track => track.stop());
+            synth.cancel();
+        });
+
+    </script>
+</body>
+</html>
